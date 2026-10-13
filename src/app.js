@@ -1,0 +1,31 @@
+import express from "express";
+import helmet from "helmet";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import {db} from "./db.js";
+import {requireAuth} from "./auth.js";
+import {getCache,setCache,invalidateCache} from "./cache.js";
+import {classifyMessage} from "./classifier.js";
+import {createTicketReport} from "./report.js";
+import {registerSchema,loginSchema,ticketSchema,updateTicketSchema} from "./validation.js";
+export const app=express();
+app.use(helmet());app.use(cors());app.use(express.json({limit:"32kb"}));
+const authLimiter=rateLimit({windowMs:15*60*1000,limit:30,standardHeaders:true,legacyHeaders:false});
+app.get("/health",(_req,res)=>res.json({status:"ok"}));
+function parse(schema,body,res){const r=schema.safeParse(body);if(!r.success){res.status(400).json({error:"Invalid request.",details:r.error.issues.map(x=>({path:x.path.join("."),message:x.message}))});return null;}return r.data;}
+function tokenFor(user){return jwt.sign({sub:String(user.id),email:user.email},process.env.JWT_SECRET,{expiresIn:"12h"});}
+app.post("/api/auth/register",authLimiter,async(req,res,next)=>{try{const input=parse(registerSchema,req.body,res);if(!input)return;const email=input.email.toLowerCase();if(db.prepare("SELECT id FROM users WHERE email=?").get(email))return res.status(409).json({error:"Email already registered."});const hash=await bcrypt.hash(input.password,12);const id=Number(db.prepare("INSERT INTO users(name,email,password_hash) VALUES(?,?,?)").run(input.name,email,hash).lastInsertRowid);res.status(201).json({token:tokenFor({id,email}),user:{id,name:input.name,email}});}catch(e){next(e);}});
+app.post("/api/auth/login",authLimiter,async(req,res,next)=>{try{const input=parse(loginSchema,req.body,res);if(!input)return;const email=input.email.toLowerCase(),u=db.prepare("SELECT id,name,email,password_hash FROM users WHERE email=?").get(email);if(!u||!(await bcrypt.compare(input.password,u.password_hash)))return res.status(401).json({error:"Invalid email or password."});res.json({token:tokenFor(u),user:{id:u.id,name:u.name,email:u.email}});}catch(e){next(e);}});
+app.use("/api",requireAuth);
+app.get("/api/me",(req,res)=>{const user=db.prepare("SELECT id,name,email,created_at FROM users WHERE id=?").get(req.user.id);if(!user)return res.status(404).json({error:"User not found."});res.json({user});});
+app.post("/api/tickets",async(req,res,next)=>{try{const input=parse(ticketSchema,req.body,res);if(!input)return;const c=await classifyMessage(input.message);const id=Number(db.prepare("INSERT INTO tickets(user_id,subject,message,category,priority,ai_summary) VALUES(?,?,?,?,?,?)").run(req.user.id,input.subject,input.message,c.category,c.priority,c.summary).lastInsertRowid);db.prepare("INSERT INTO ai_usage(user_id,ticket_id,provider,model,estimated_cost_usd) VALUES(?,?,?,?,?)").run(req.user.id,id,c.provider,c.model,c.estimatedCostUsd);invalidateCache("summary:"+req.user.id);res.status(201).json({ticket:db.prepare("SELECT * FROM tickets WHERE id=? AND user_id=?").get(id,req.user.id),classification:{provider:c.provider,model:c.model,fallback:c.fallback,estimatedCostUsd:c.estimatedCostUsd}});}catch(e){next(e);}});
+app.get("/api/tickets",(req,res)=>{const s=req.query.status;if(s&&!["open","in_progress","resolved"].includes(s))return res.status(400).json({error:"Invalid status filter."});const rows=s?db.prepare("SELECT * FROM tickets WHERE user_id=? AND status=? ORDER BY created_at DESC").all(req.user.id,s):db.prepare("SELECT * FROM tickets WHERE user_id=? ORDER BY created_at DESC").all(req.user.id);res.json({count:rows.length,tickets:rows});});
+app.get("/api/tickets/:id",(req,res)=>{const t=db.prepare("SELECT * FROM tickets WHERE id=? AND user_id=?").get(Number(req.params.id),req.user.id);if(!t)return res.status(404).json({error:"Ticket not found."});res.json({ticket:t});});
+app.patch("/api/tickets/:id",(req,res)=>{const input=parse(updateTicketSchema,req.body,res);if(!input)return;const t=db.prepare("SELECT * FROM tickets WHERE id=? AND user_id=?").get(Number(req.params.id),req.user.id);if(!t)return res.status(404).json({error:"Ticket not found."});db.prepare("UPDATE tickets SET status=?,priority=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(input.status??t.status,input.priority??t.priority,t.id);invalidateCache("summary:"+req.user.id);res.json({ticket:db.prepare("SELECT * FROM tickets WHERE id=?").get(t.id)});});
+app.post("/api/classify",async(req,res,next)=>{try{const input=parse(ticketSchema.pick({message:true}),req.body,res);if(!input)return;const c=await classifyMessage(input.message);db.prepare("INSERT INTO ai_usage(user_id,provider,model,estimated_cost_usd) VALUES(?,?,?,?)").run(req.user.id,c.provider,c.model,c.estimatedCostUsd);res.json(c);}catch(e){next(e);}});
+app.get("/api/summary",(req,res)=>{const key="summary:"+req.user.id,hit=getCache(key);if(hit)return res.json({...hit,cached:true});const summary=db.prepare("SELECT COUNT(*) total,SUM(status='open') open,SUM(status='in_progress') in_progress,SUM(status='resolved') resolved,SUM(priority IN ('high','urgent')) high_priority FROM tickets WHERE user_id=?").get(req.user.id);const categories=db.prepare("SELECT category,COUNT(*) count FROM tickets WHERE user_id=? GROUP BY category ORDER BY count DESC").all(req.user.id);const aiUsage=db.prepare("SELECT COUNT(*) calls,COALESCE(SUM(estimated_cost_usd),0) estimated_cost_usd FROM ai_usage WHERE user_id=?").get(req.user.id);const out={summary,categories,aiUsage,cached:false};setCache(key,out,30000);res.json(out);});
+app.get("/api/reports/tickets.pdf",async(req,res,next)=>{try{const pdf=await createTicketReport(req.user.id);res.setHeader("Content-Type","application/pdf");res.setHeader("Content-Disposition",'attachment; filename="support-ticket-insights.pdf"');res.send(pdf);}catch(e){next(e);}});
+app.get("/api/jobs",(req,res)=>res.json({jobs:db.prepare("SELECT id,job_name,processed_count,status,detail,created_at FROM job_runs ORDER BY id DESC LIMIT 20").all()}));
+app.use((err,_req,res,_next)=>{console.error("Request failed:",err.message);res.status(500).json({error:"Internal server error."});});
